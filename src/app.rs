@@ -41,9 +41,13 @@ pub enum Message {
     /// 回车：提交输入缓冲（按序号选歌）
     SubmitInput,
     /// 列表上滚一行（同时关闭自动跟随）
-    ScrollUp,
+    PlayListScrollUp,
     /// 列表下滚一行（同时关闭自动跟随）
-    ScrollDown,
+    PlayListScrollDown,
+    /// 光标上移一行（首次按下只把光标落在起点，不移动）
+    CursorScrollUp,
+    /// 光标下移一行
+    CursorScrollDown,
 }
 
 impl Message {
@@ -58,8 +62,10 @@ impl Message {
             KeyCode::Char(c) if c.is_ascii_digit() => Some(Self::Input(c)),
             KeyCode::Enter => Some(Self::SubmitInput),
             KeyCode::Backspace => Some(Self::Backspace),
-            KeyCode::Up | KeyCode::Char('k') => Some(Self::ScrollUp),
-            KeyCode::Down | KeyCode::Char('j') => Some(Self::ScrollDown),
+            KeyCode::Up => Some(Self::PlayListScrollUp),
+            KeyCode::Down => Some(Self::PlayListScrollDown),
+            KeyCode::Char('k') => Some(Self::CursorScrollUp),
+            KeyCode::Char('j') => Some(Self::CursorScrollDown),
             _ => None,
         }
     }
@@ -147,11 +153,11 @@ impl App {
         match message {
             Message::Quit => self.should_quit = true,
             Message::Next => {
-                self.view.follow = true; // 切歌 = 恢复自动跟随
+                self.follow_current(); // 切歌 = 恢复自动跟随（并收起光标）
                 let _ = self.tx.send(Command::Next);
             }
             Message::Prev => {
-                self.view.follow = true;
+                self.follow_current();
                 let _ = self.tx.send(Command::Prev);
             }
             Message::TogglePause => {
@@ -173,28 +179,77 @@ impl App {
                 let len = self.state.lock().unwrap().playlist.len();
                 let typed = self.view.input.trim().to_string();
                 match typed.parse::<usize>() {
-                    Ok(num) if (1..=len).contains(&num) => {
-                        self.view.follow = true;
-                        let _ = self.tx.send(Command::Play(num - 1)); // 转 0-based 索引
+                    // 合法序号：转 0-based 索引直接播
+                    Ok(num) if (1..=len).contains(&num) => self.play_index(num - 1),
+                    // 直接回车（空输入）：有光标就播放光标所在行（j/k 选中 → 回车播放）
+                    _ if typed.is_empty() => {
+                        if let Some(index) = self.view.cursor {
+                            self.play_index(index);
+                        }
                     }
-                    // 直接回车（空输入）不当错误处理
-                    _ if typed.is_empty() => {}
                     // 非法序号：留下可见反馈，而不是静默丢弃
                     _ => self.view.input_error = Some(typed),
                 }
                 self.view.input.clear();
             }
-            // 手动滚动 = 把窗口起点交给用户，并关掉自动跟随
-            Message::ScrollUp => {
+            // 手动滚动窗口 = 纯「看一看」，不选歌，所以顺手收起光标
+            Message::PlayListScrollUp => {
                 self.view.follow = false;
+                self.view.cursor = None;
                 self.view.offset = self.view.offset.saturating_sub(1);
             }
-            Message::ScrollDown => {
+            Message::PlayListScrollDown => {
                 self.view.follow = false;
+                self.view.cursor = None;
                 // 上界不在这里夹：只有渲染时才知道可视行数
                 self.view.offset = self.view.offset.saturating_add(1);
             }
+
+            Message::CursorScrollUp => self.move_cursor(-1),
+            Message::CursorScrollDown => self.move_cursor(1),
         }
+    }
+
+    /// 回到「跟随当前歌曲」模式：窗口跟着歌走，光标收起（选歌 / 切歌都走这里）
+    fn follow_current(&mut self) {
+        self.view.follow = true;
+        self.view.cursor = None;
+    }
+
+    /// 播放指定索引（0-based）：选歌即回到跟随模式
+    fn play_index(&mut self, index: usize) {
+        self.follow_current();
+        let _ = self.tx.send(Command::Play(index));
+    }
+
+    /// 移动列表光标（j/k）
+    ///
+    /// 光标是**选择**，窗口是**视野**：这里只动光标，「让光标可见」的活儿
+    /// 交给渲染层（只有渲染时才知道可视行数）。
+    fn move_cursor(&mut self, delta: isize) {
+        let (len, playing) = {
+            let state = self.state.lock().unwrap();
+            (state.playlist.len(), state.current_index)
+        };
+        if len == 0 {
+            return;
+        }
+
+        // 起点：已有光标就从光标走；否则落在「当前歌曲」或「窗口顶端」上
+        let start = self
+            .view
+            .cursor
+            .or(playing)
+            .unwrap_or(self.view.offset)
+            .min(len - 1);
+        let next = match self.view.cursor {
+            None => start, // 首次按下只落点，免得一下跳两行
+            Some(cur) if delta < 0 => cur.saturating_sub(1),
+            Some(cur) => (cur + 1).min(len - 1),
+        };
+
+        self.view.follow = false; // 用户接管 → 摘掉自动跟随
+        self.view.cursor = Some(next);
     }
 
     /// 渲染一帧：加锁读取共享模型后交给渲染层

@@ -29,7 +29,11 @@ pub struct ViewState {
     pub input_error: Option<String>,
     /// 列表窗口第一项的下标
     pub offset: usize,
-    /// 是否让窗口自动跟随当前歌曲（用户一滚动就关，一选歌就恢复）
+    /// 列表光标（j/k 移动、回车播放）；`None` 表示没有光标
+    ///
+    /// 不变式：`follow == true` 时恒为 `None` —— 自动跟随模式下「当前歌曲」就是唯一焦点。
+    pub cursor: Option<usize>,
+    /// 是否让窗口自动跟随当前歌曲（用户一滚动/一移光标就关，一选歌就恢复）
     pub follow: bool,
 }
 
@@ -39,6 +43,7 @@ impl ViewState {
             input: String::new(),
             input_error: None,
             offset: 0,
+            cursor: None,
             follow: true,
         }
     }
@@ -82,9 +87,9 @@ fn render_title(frame: &mut Frame, state: &PlayerState, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-/// 播放列表：当前歌曲用 `▶` + 绿色加粗标记
+/// 播放列表：当前歌曲用 `▶` + 绿色加粗，光标另叠一层反色
 ///
-/// `▶` 是逐项判断 `is_current` 画出来的，跟「窗口在哪」无关；
+/// `▶` 与光标都是逐项判断画出来的，跟「窗口在哪」无关；
 /// 窗口起点则完全由 [`ViewState`] 决定（见下方 `follow` 分支）。
 fn render_playlist(frame: &mut Frame, state: &PlayerState, view: &mut ViewState, area: Rect) {
     let items: Vec<ListItem> = state
@@ -97,11 +102,18 @@ fn render_playlist(frame: &mut Frame, state: &PlayerState, view: &mut ViewState,
                 .and_then(|n| n.to_str())
                 .unwrap_or("未知文件");
             let is_current = state.current_index == Some(idx);
+            let is_cursor = view.cursor == Some(idx);
             let marker = if is_current { "▶ " } else { "  " };
+            // 当前播放 → 绿色加粗；光标 → 再叠一层反色（同一行时就是反色绿）
             let style = if is_current {
                 Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
+            };
+            let style = if is_cursor {
+                style.add_modifier(Modifier::REVERSED)
+            } else {
+                style
             };
             // 行号始终是歌单中的真实序号（1-based），键盘数字选歌才能对应得上
             ListItem::new(Line::from(format!("{marker}{:>3}. {name}", idx + 1))).style(style)
@@ -110,12 +122,14 @@ fn render_playlist(frame: &mut Frame, state: &PlayerState, view: &mut ViewState,
 
     let border_style = Style::new().fg(Color::DarkGray);
     let len = state.playlist.len();
+    // 标题顺带提示当前处于哪种「非跟随」模式
+    let suffix = match view.cursor {
+        Some(cursor) => format!(" — 光标 第 {} 首", cursor + 1),
+        None if !view.follow => " — 手动滚动".to_string(),
+        None => String::new(),
+    };
     let block = Block::bordered()
-        .title(if view.follow {
-            format!(" 📋 播放列表 (共 {len} 首) ")
-        } else {
-            format!(" 📋 播放列表 (共 {len} 首) — 手动滚动 ")
-        })
+        .title(format!(" 📋 播放列表 (共 {len} 首){suffix} "))
         .border_style(border_style);
 
     // 可视行数 = 区域高度 - 上下边框（与 List 内部拿到的 list_height 一致）
@@ -130,8 +144,15 @@ fn render_playlist(frame: &mut Frame, state: &PlayerState, view: &mut ViewState,
                 None => 0,
             };
         } else {
-            // 手动滚动：只在这里夹紧上界
-            // （为什么不在 update 里夹：只有渲染时才知道可视行数）
+            // 光标动过之后，用「最小必要的位移」把它纳入视野
+            if let Some(cursor) = view.cursor {
+                if cursor < view.offset {
+                    view.offset = cursor;
+                } else if cursor >= view.offset + visible {
+                    view.offset = cursor + 1 - visible;
+                }
+            }
+            // 最后夹紧上界（只有渲染时才知道可视行数）
             view.offset = view.offset.min(len.saturating_sub(visible));
         }
     }
@@ -189,7 +210,10 @@ fn render_status(frame: &mut Frame, state: &PlayerState, view: &ViewState, area:
     // 输入行：三态 —— 报错（红）/ 空（灰提示）/ 输入中（黄 + 光标块）
     let input_line = if let Some(rejected) = &view.input_error {
         Line::styled(
-            format!("输入: {rejected} ✗ 序号超出范围（1-{}）", state.playlist.len()),
+            format!(
+                "输入: {rejected} ✗ 序号超出范围（1-{}）",
+                state.playlist.len()
+            ),
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
     } else if view.input.is_empty() {
@@ -240,7 +264,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let style = Style::new().fg(Color::DarkGray);
     let help = Paragraph::new(vec![
         Line::from(" 数字+回车 → 播放指定歌曲 | n → 下一首 | p → 上一首"),
-        Line::from(" ↑/↓ 或 j/k → 滚动列表（选歌后自动恢复跟随）"),
+        Line::from(" j/k → 移动光标（回车播放） | ↑/↓ → 滚动窗口"),
         Line::from(" 空格 → 暂停/继续 | m → 切换播放模式 | q → 退出"),
     ])
     .style(style)
