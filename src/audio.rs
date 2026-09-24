@@ -33,8 +33,10 @@ pub fn audio_thread(
     loop {
         // 1. 非阻塞处理控制命令
         match rx.try_recv() {
+            // 退出：停播放后结束循环。
+            // （不再需要置一个 running 标志：主线程不再轮询它，
+            //   而 recv 端断开时下面的 Disconnected 分支也会让循环退出）
             Ok(Command::Quit) => {
-                state.lock().unwrap().running = false;
                 player.stop();
                 break;
             }

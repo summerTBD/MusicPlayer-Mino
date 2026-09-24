@@ -1,167 +1,254 @@
-//! 终端界面渲染
+//! 终端界面渲染（ratatui）
 //!
-//! 策略：**静态内容只打印一次，动态内容原地重绘**。
-//! - 标题、播放列表、快捷键等静态内容在启动时打印一次；
-//! - 状态、当前歌曲、进度条、输入行等动态内容锚定在屏幕底部，
-//!   每帧先擦除整行再重绘，避免整个界面反复输出导致页面不断向下滚动。
+//! 只负责「把状态画出来」：不修改状态、不发送命令、不关心事件。
+//! 布局自上而下：标题 / 播放列表 / 播放状态（含进度条与输入行）/ 快捷键。
+//!
+//! 屏幕输出、清屏、光标、双缓冲全部交给 ratatui 的 `Terminal`，
+//! 因此不再需要旧版那套「静态只打印一次 + 手动定位擦行」的技巧。
 
-use std::io::{self, Write};
 use std::time::Duration;
 
-use crossterm::{
-    cursor, queue,
-    terminal::{self, Clear, ClearType},
-};
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Gauge, List, ListItem, ListState, Paragraph};
 
 use crate::state::PlayerState;
 
-/// 动态状态区的位置与尺寸
-pub struct StatusArea {
-    /// 状态区起始行（0-based）
-    pub row: u16,
-    /// 状态区占用的行数（4 行：状态/当前/进度/输入）
-    pub height: u16,
+/// 视图状态：只影响「怎么画」，与音频线程无关。
+///
+/// 单独成类型，是为了让 [`render`] 的入参一眼分清两类东西：
+/// - [`PlayerState`]：**模型**，跳线程共享（音频线程写，这里只读）；
+/// - `ViewState`：**视图**，只属于主线程（事件改，渲染时可能夹紧边界）。
+#[derive(Debug)]
+pub struct ViewState {
+    /// 数字输入缓冲
+    pub input: String,
+    /// 最近一次被拒绝的输入（用于红字提示），`None` 表示无错误
+    pub input_error: Option<String>,
+    /// 列表窗口第一项的下标
+    pub offset: usize,
+    /// 是否让窗口自动跟随当前歌曲（用户一滚动就关，一选歌就恢复）
+    pub follow: bool,
 }
 
-/// 一次性绘制静态部分（标题、列表、快捷键），并返回动态状态区位置。
-///
-/// 动态区固定在屏幕底部，列表太长时自动截断，避免与动态区重叠。
-pub fn init_ui(state: &PlayerState) -> io::Result<StatusArea> {
-    let (_, height) = terminal::size()?;
-    let height = height.saturating_sub(1); // 最大行号（0-based）
-
-    // 底部布局（从下往上）：
-    //   height-8 ..= height-5 : 动态区（状态/当前/进度/输入）
-    //   height-9              : 分隔线
-    //   height-4              : 分隔线
-    //   height-3 ..= height-1 : 快捷键
-    let status_row = height.saturating_sub(8);
-
-    let mut stdout = io::stdout().lock();
-    queue!(stdout, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
-
-    // ---- 顶部静态：标题 + 列表（超出可视区部分截断） ----
-    writeln!(stdout, "🎵 终端音乐播放器")?;
-    writeln!(stdout, "{}", separator())?;
-    writeln!(stdout, "📋 播放列表 (共 {} 首)", state.playlist.len())?;
-
-    // 标题(1) + 分隔线(1) + 列表标题(1) 占 3 行，剩余空间给列表项；
-    // 顶部内容不能越过 height-9 的分隔线，若列表被截断还要预留 1 行显示提示。
-    let max_items = height.saturating_sub(13) as usize;
-    let shown = state.playlist.len().min(max_items);
-    for (i, path) in state.playlist.iter().take(shown).enumerate() {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("未知文件");
-        writeln!(stdout, "  {:>2}. {}", i + 1, name)?;
+impl ViewState {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+            input_error: None,
+            offset: 0,
+            follow: true,
+        }
     }
-    if state.playlist.len() > shown {
-        writeln!(stdout, "  … 还有 {} 首未显示", state.playlist.len() - shown)?;
-    }
-    stdout.flush()?;
-
-    // ---- 底部静态：分隔线 + 快捷键 ----
-    let mut stdout = io::stdout().lock();
-    queue!(stdout, cursor::MoveTo(0, status_row.saturating_sub(1)))?;
-    write!(stdout, "{}", separator())?;
-    queue!(stdout, cursor::MoveTo(0, height.saturating_sub(4)))?;
-    write!(stdout, "{}", separator())?;
-    queue!(stdout, cursor::MoveTo(0, height.saturating_sub(3)))?;
-    write!(stdout, "⌨️  快捷键:")?;
-    queue!(stdout, cursor::MoveTo(0, height.saturating_sub(2)))?;
-    write!(
-        stdout,
-        "  数字+回车 → 播放指定歌曲 | n → 下一首 | p → 上一首"
-    )?;
-    queue!(stdout, cursor::MoveTo(0, height.saturating_sub(1)))?;
-    write!(stdout, "  空格 → 暂停/继续 | m → 切换播放模式 | q → 退出")?;
-    stdout.flush()?;
-
-    Ok(StatusArea {
-        row: status_row,
-        height: 4,
-    })
 }
 
-/// 原地重绘动态状态区（状态、当前歌曲、进度条、输入行）。
-///
-/// 每行先擦除再写入，不会在屏幕上累积残留内容。
-pub fn update_status(state: &PlayerState, area: &StatusArea) -> io::Result<()> {
-    let mut stdout = io::stdout().lock();
+impl Default for ViewState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    // 状态行
-    let status_text = match (state.current_index, state.is_paused) {
-        (None, _) => "⏹ 停止",
-        (Some(_), true) => "⏸ 暂停",
-        (Some(_), false) => "▶ 播放中",
-    };
-    draw_line(
-        &mut stdout,
-        area.row,
-        &format!(
-            "状态: {} | 模式: {}",
-            status_text,
-            state.play_mode.to_display_str()
+/// 渲染一帧。
+///
+/// 模型（`state`）只读；`view` 是可变的，但只会动视图自己的东西
+/// （把窗口起点夹紧到合法范围），不会反向影响模型。
+pub fn render(frame: &mut Frame, state: &PlayerState, view: &mut ViewState) {
+    let [title_area, list_area, status_area, help_area] = Layout::vertical([
+        Constraint::Length(3), // 标题（带边框）
+        Constraint::Min(5),    // 播放列表：占满剩余空间
+        Constraint::Length(6), // 状态 + 进度条 + 输入（带边框，内部 4 行）
+        Constraint::Length(5), // 快捷键（带边框，内部 3 行）
+    ])
+    .areas(frame.area());
+
+    render_title(frame, state, title_area);
+    render_playlist(frame, state, view, list_area);
+    render_status(frame, state, view, status_area);
+    render_help(frame, help_area);
+}
+
+/// 顶部标题栏
+fn render_title(frame: &mut Frame, state: &PlayerState, area: Rect) {
+    let title = Line::from(vec![
+        Span::styled(
+            "🎵 终端音乐播放器",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
-    )?;
+        Span::raw(format!("   共 {} 首", state.playlist.len())),
+    ]);
+    let paragraph = Paragraph::new(title).block(bordered("", Style::new().fg(Color::DarkGray)));
+    frame.render_widget(paragraph, area);
+}
 
-    // 当前歌曲
-    let id = match state.current_index {
-        Some(idx) => idx + 1,
-        None => 0,
+/// 播放列表：当前歌曲用 `▶` + 绿色加粗标记
+///
+/// `▶` 是逐项判断 `is_current` 画出来的，跟「窗口在哪」无关；
+/// 窗口起点则完全由 [`ViewState`] 决定（见下方 `follow` 分支）。
+fn render_playlist(frame: &mut Frame, state: &PlayerState, view: &mut ViewState, area: Rect) {
+    let items: Vec<ListItem> = state
+        .playlist
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("未知文件");
+            let is_current = state.current_index == Some(idx);
+            let marker = if is_current { "▶ " } else { "  " };
+            let style = if is_current {
+                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            // 行号始终是歌单中的真实序号（1-based），键盘数字选歌才能对应得上
+            ListItem::new(Line::from(format!("{marker}{:>3}. {name}", idx + 1))).style(style)
+        })
+        .collect();
+
+    let border_style = Style::new().fg(Color::DarkGray);
+    let len = state.playlist.len();
+    let block = Block::bordered()
+        .title(if view.follow {
+            format!(" 📋 播放列表 (共 {len} 首) ")
+        } else {
+            format!(" 📋 播放列表 (共 {len} 首) — 手动滚动 ")
+        })
+        .border_style(border_style);
+
+    // 可视行数 = 区域高度 - 上下边框（与 List 内部拿到的 list_height 一致）
+    let visible = area.height.saturating_sub(2) as usize;
+    if visible > 0 {
+        if view.follow {
+            // 自动跟随：每帧由当前歌曲推导窗口起点（尽量让它居中）
+            view.offset = match state.current_index {
+                Some(cur) => cur
+                    .saturating_sub(visible / 2)
+                    .min(len.saturating_sub(visible)),
+                None => 0,
+            };
+        } else {
+            // 手动滚动：只在这里夹紧上界
+            // （为什么不在 update 里夹：只有渲染时才知道可视行数）
+            view.offset = view.offset.min(len.saturating_sub(visible));
+        }
+    }
+
+    // 当前歌曲已用 `▶` + 颜色标注，所以不用 List 自带的选中高亮
+    let list = List::new(items).block(block);
+    let mut list_state = ListState::default().with_offset(view.offset);
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// 播放状态：状态行、当前歌曲、进度条、输入行
+fn render_status(frame: &mut Frame, state: &PlayerState, view: &ViewState, area: Rect) {
+    let border_style = Style::new().fg(Color::DarkGray);
+    let block = Block::bordered()
+        .title(" 播放状态 ")
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [info_area, gauge_area, input_area] = Layout::vertical([
+        Constraint::Length(2), // 状态 + 当前歌曲
+        Constraint::Length(1), // 进度条
+        Constraint::Length(1), // 输入行
+    ])
+    .areas(inner);
+
+    // 状态行 + 当前歌曲（两行）
+    let status_span = match (state.current_index, state.is_paused) {
+        (None, _) => Span::styled("⏹ 停止", Style::new().fg(Color::DarkGray)),
+        (Some(_), true) => Span::styled("⏸ 暂停", Style::new().fg(Color::Yellow)),
+        (Some(_), false) => Span::styled("▶ 播放中", Style::new().fg(Color::Green)),
     };
-    draw_line(
-        &mut stdout,
-        area.row + 1,
-        &format!("当前:第{}首 {}", id, state.current_song_name()),
-    )?;
+    let current_no = state.current_index.map(|i| i + 1).unwrap_or(0);
+    let info = Paragraph::new(vec![
+        Line::from(vec![
+            Span::raw("状态: "),
+            status_span,
+            Span::raw(format!("  |  模式: {}", state.play_mode.to_display_str())),
+        ]),
+        Line::from(format!(
+            "当前: 第{current_no}首 {}",
+            state.current_song_name()
+        )),
+    ]);
+    frame.render_widget(info, info_area);
 
-    // 进度条（使用 ASCII `#`/`-` 保证任意终端都能正常渲染；
-    // 条宽 30，加上时间信息总宽约 74 列，避免在 80 列终端上换行导致重绘错乱）
-    let progress = if state.current_index.is_some() && state.total_duration > Duration::ZERO {
-        let total = state.total_duration.as_secs_f32();
-        let current = state.estimated_position.as_secs_f32().min(total);
-        let percent = current / total;
-        let bar_width = 30;
-        let filled = (percent * bar_width as f32).round() as usize;
-        let empty = bar_width - filled;
-        format!(
-            "[{}{}] {:02}:{:02} / {:02}:{:02}",
-            "#".repeat(filled),
-            "-".repeat(empty),
-            (current / 60.0) as u32,
-            (current % 60.0) as u32,
-            (total / 60.0) as u32,
-            (total % 60.0) as u32
+    // 进度条：宽度随终端自适应，不再需要手算条形宽度
+    let (ratio, label) = progress(state);
+    let gauge = Gauge::default()
+        .ratio(ratio)
+        .label(label)
+        .gauge_style(Style::new().fg(Color::Green));
+    frame.render_widget(gauge, gauge_area);
+
+    // 输入行：三态 —— 报错（红）/ 空（灰提示）/ 输入中（黄 + 光标块）
+    let input_line = if let Some(rejected) = &view.input_error {
+        Line::styled(
+            format!("输入: {rejected} ✗ 序号超出范围（1-{}）", state.playlist.len()),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else if view.input.is_empty() {
+        Line::styled(
+            "输入: 数字 + 回车 → 跳转歌曲",
+            Style::new().fg(Color::DarkGray),
         )
     } else {
-        format!("[{}] --:-- / --:--", "-".repeat(30))
+        Line::styled(
+            format!("输入: {}▏", view.input),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
     };
-    draw_line(&mut stdout, area.row + 2, &progress)?;
-
-    // 输入行
-    draw_line(
-        &mut stdout,
-        area.row + 3,
-        &format!("输入: {}", state.input_buffer),
-    )?;
-
-    stdout.flush()
+    frame.render_widget(Paragraph::new(input_line), input_area);
 }
 
-/// 移到指定行，先擦除整行再写入新内容
-fn draw_line(stdout: &mut impl Write, row: u16, text: &str) -> io::Result<()> {
-    queue!(
-        stdout,
-        cursor::MoveTo(0, row),
-        Clear(ClearType::UntilNewLine)
-    )?;
-    write!(stdout, "{text}")?;
-    Ok(())
+/// 计算进度条的比例与时间标签
+fn progress(state: &PlayerState) -> (f64, String) {
+    if state.current_index.is_none() || state.total_duration == Duration::ZERO {
+        return (0.0, "--:-- / --:--".to_string());
+    }
+    let total = state.total_duration.as_secs_f64();
+    let current = state.estimated_position.as_secs_f64().min(total);
+    let ratio = if total > 0.0 {
+        (current / total).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (
+        ratio,
+        format!("{} / {}", format_time(current), format_time(total)),
+    )
 }
 
-/// 生成分隔线
-fn separator() -> String {
-    "─".repeat(55)
+/// 秒数格式化为 `mm:ss`（超过一小时则为 `h:mm:ss`）
+fn format_time(secs: f64) -> String {
+    let total = secs.max(0.0) as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// 底部快捷键提示
+fn render_help(frame: &mut Frame, area: Rect) {
+    let style = Style::new().fg(Color::DarkGray);
+    let help = Paragraph::new(vec![
+        Line::from(" 数字+回车 → 播放指定歌曲 | n → 下一首 | p → 上一首"),
+        Line::from(" ↑/↓ 或 j/k → 滚动列表（选歌后自动恢复跟随）"),
+        Line::from(" 空格 → 暂停/继续 | m → 切换播放模式 | q → 退出"),
+    ])
+    .style(style)
+    .block(bordered(" ⌨️ 快捷键 ", style));
+    frame.render_widget(help, area);
+}
+
+/// 带边框的区块（统一边框颜色），`title` 为空时不显示标题
+fn bordered<'a>(title: impl Into<Line<'a>>, style: Style) -> Block<'a> {
+    Block::bordered().title(title).border_style(style)
 }

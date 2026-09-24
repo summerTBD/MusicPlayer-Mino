@@ -61,9 +61,6 @@ pub struct PlayerState {
     pub estimated_position: Duration,
     pub is_paused: bool,
     pub play_mode: PlayMode,
-    pub running: bool,
-    /// 用户输入的数字缓冲区
-    pub input_buffer: String,
 }
 
 impl PlayerState {
@@ -75,8 +72,6 @@ impl PlayerState {
             estimated_position: Duration::ZERO,
             is_paused: false,
             play_mode: PlayMode::Sequential,
-            running: true,
-            input_buffer: String::new(),
         }
     }
 
