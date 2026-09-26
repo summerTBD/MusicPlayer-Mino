@@ -46,6 +46,8 @@ pub enum Command {
     TogglePause,
     /// 切换播放模式
     SetMode(PlayMode),
+    /// 设置音量（0.0 ~ 1.0）
+    SetVolume(f32),
     /// 停止播放
     Stop,
     /// 退出程序
@@ -61,10 +63,13 @@ pub struct PlayerState {
     pub estimated_position: Duration,
     pub is_paused: bool,
     pub play_mode: PlayMode,
+    /// 当前音量（0.0 ~ 1.0）；主线程按键改，音频线程据此设置播放器
+    pub volume: f32,
 }
 
 impl PlayerState {
-    pub fn new(playlist: Vec<PathBuf>) -> Self {
+    /// `volume` 为初始音量（来自配置），取值 0.0 ~ 1.0
+    pub fn new(playlist: Vec<PathBuf>, volume: f32) -> Self {
         Self {
             playlist,
             current_index: None,
@@ -72,7 +77,17 @@ impl PlayerState {
             estimated_position: Duration::ZERO,
             is_paused: false,
             play_mode: PlayMode::Sequential,
+            volume: volume.clamp(0.0, 1.0),
         }
+    }
+
+    /// 按步长调整音量，返回夹紧后的新值。
+    ///
+    /// 结果取整到 1%（0.05 的二进制表示不精确，不取整会累出 79.999% 这种显示）
+    pub fn adjust_volume(&mut self, delta: f32) -> f32 {
+        let next = (self.volume + delta).clamp(0.0, 1.0);
+        self.volume = (next * 100.0).round() / 100.0;
+        self.volume
     }
 
     /// 获取当前歌曲文件名

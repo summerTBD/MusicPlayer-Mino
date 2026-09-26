@@ -5,7 +5,7 @@
 //! - [`ui`]：ratatui 渲染层（只读状态、无副作用）；
 //! - [`state`]：跨线程共享的播放状态与命令定义；
 //! - [`audio`]：音频后台线程（解码 / 播放 / 自动切歌）；
-//! - [`music`]：音乐文件扫描；[`config`]：全局常量。
+//! - [`music`]：音乐文件扫描；[`config`]：全局配置（默认值 + `mino.toml` 覆盖）。
 
 pub mod app;
 pub mod audio;

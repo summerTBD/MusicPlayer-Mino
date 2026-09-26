@@ -14,6 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Gauge, List, ListItem, ListState, Paragraph};
 
+use crate::config::Config;
 use crate::state::PlayerState;
 
 /// 视图状态：只影响「怎么画」，与音频线程无关。
@@ -57,33 +58,46 @@ impl Default for ViewState {
 
 /// 渲染一帧。
 ///
-/// 模型（`state`）只读；`view` 是可变的，但只会动视图自己的东西
+/// 模型（`state`）与配置（`config`）只读；`view` 是可变的，但只会动视图自己的东西
 /// （把窗口起点夹紧到合法范围），不会反向影响模型。
-pub fn render(frame: &mut Frame, state: &PlayerState, view: &mut ViewState) {
+pub fn render(frame: &mut Frame, state: &PlayerState, config: &Config, view: &mut ViewState) {
+    // 配置出错时标题栏多留一行放告警
+    let title_height = if config.error.is_some() { 4 } else { 3 };
     let [title_area, list_area, status_area, help_area] = Layout::vertical([
-        Constraint::Length(3), // 标题（带边框）
-        Constraint::Min(5),    // 播放列表：占满剩余空间
-        Constraint::Length(6), // 状态 + 进度条 + 输入（带边框，内部 4 行）
-        Constraint::Length(5), // 快捷键（带边框，内部 3 行）
+        Constraint::Length(title_height), // 标题（带边框）
+        Constraint::Min(5),               // 播放列表：占满剩余空间
+        Constraint::Length(6),            // 状态 + 进度条 + 输入（带边框，内部 4 行）
+        Constraint::Length(5),            // 快捷键（带边框，内部 3 行）
     ])
     .areas(frame.area());
 
-    render_title(frame, state, title_area);
+    render_title(frame, state, config, title_area);
     render_playlist(frame, state, view, list_area);
     render_status(frame, state, view, status_area);
     render_help(frame, help_area);
 }
 
-/// 顶部标题栏
-fn render_title(frame: &mut Frame, state: &PlayerState, area: Rect) {
+/// 顶部标题栏：曲目数 + 当前生效的配置文件；配置出错时附一行红字原因
+fn render_title(frame: &mut Frame, state: &PlayerState, config: &Config, area: Rect) {
     let title = Line::from(vec![
         Span::styled(
             "🎵 终端音乐播放器",
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!("   共 {} 首", state.playlist.len())),
+        Span::styled(
+            format!("  |  配置: {}", config.source_label()),
+            Style::new().fg(Color::DarkGray),
+        ),
     ]);
-    let paragraph = Paragraph::new(title).block(bordered("", Style::new().fg(Color::DarkGray)));
+    let mut lines = vec![title];
+    if let Some(error) = &config.error {
+        lines.push(Line::styled(
+            format!("⚠️ {error}"),
+            Style::new().fg(Color::Red),
+        ));
+    }
+    let paragraph = Paragraph::new(lines).block(bordered("", Style::new().fg(Color::DarkGray)));
     frame.render_widget(paragraph, area);
 }
 
@@ -186,11 +200,21 @@ fn render_status(frame: &mut Frame, state: &PlayerState, view: &ViewState, area:
         (Some(_), false) => Span::styled("▶ 播放中", Style::new().fg(Color::Green)),
     };
     let current_no = state.current_index.map(|i| i + 1).unwrap_or(0);
+    // 音量归零时标红，省得用户以为是歌没声
+    let volume_span = Span::styled(
+        format!("  |  音量: {:.0}%", state.volume * 100.0),
+        Style::new().fg(if state.volume == 0.0 {
+            Color::Red
+        } else {
+            Color::Cyan
+        }),
+    );
     let info = Paragraph::new(vec![
         Line::from(vec![
             Span::raw("状态: "),
             status_span,
             Span::raw(format!("  |  模式: {}", state.play_mode.to_display_str())),
+            volume_span,
         ]),
         Line::from(format!(
             "当前: 第{current_no}首 {}",
@@ -265,7 +289,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let help = Paragraph::new(vec![
         Line::from(" 数字+回车 → 播放指定歌曲 | n → 下一首 | p → 上一首"),
         Line::from(" j/k → 移动光标（回车播放） | ↑/↓ → 滚动窗口"),
-        Line::from(" 空格 → 暂停/继续 | m → 切换播放模式 | q → 退出"),
+        Line::from(" 空格 → 暂停/继续 | m → 切换播放模式 | +/- → 音量 | q → 退出"),
     ])
     .style(style)
     .block(bordered(" ⌨️ 快捷键 ", style));
@@ -275,4 +299,57 @@ fn render_help(frame: &mut Frame, area: Rect) {
 /// 带边框的区块（统一边框颜色），`title` 为空时不显示标题
 fn bordered<'a>(title: impl Into<Line<'a>>, style: Style) -> Block<'a> {
     Block::bordered().title(title).border_style(style)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// 把一帧画到内存缓冲里再抽成文本，不碰真实终端
+    fn render_text(config: &Config, volume: f32) -> String {
+        let state = PlayerState::new(vec![PathBuf::from("a.mp3")], volume);
+        let mut view = ViewState::new();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, config, &mut view))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 去掉所有空白再比对：宽字符（中文/emoji）在缓冲里会多占一个补位格，
+    /// 逐格取字符会把这些补位格读成空格，直接 `contains` 整句必然对不上。
+    fn squeeze(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn shows_volume_config_source_and_hotkey() {
+        let text = squeeze(&render_text(&Config::default(), 0.8));
+        assert!(text.contains("音量:80%"), "界面没显示音量:\n{text}");
+        assert!(text.contains("配置:"), "界面没显示配置来源:\n{text}");
+        assert!(text.contains("+/-→音量"), "快捷键提示缺音量:\n{text}");
+    }
+
+    #[test]
+    fn shows_warning_when_config_failed() {
+        let config = Config {
+            error: Some("解析失败".to_string()),
+            ..Config::default()
+        };
+        let text = render_text(&config, 0.5);
+        assert!(text.contains('⚠'), "配置出错时没有告警:\n{text}");
+    }
 }

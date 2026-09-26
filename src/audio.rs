@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
 
-use crate::config::{DEFAULT_VOLUME, UI_REFRESH_MS};
+use crate::config::UI_REFRESH_MS;
 use crate::state::{Command, PlayMode, PlayerState};
 
 /// 解码后的音频源类型（`BufReader<File>` 可随机访问，供解码器流式读取）
@@ -28,7 +28,8 @@ pub fn audio_thread(
     // 关闭设备句柄被丢弃时的默认日志输出，避免噪音混入界面
     sink_handle.log_on_drop(false);
     let player = Player::connect_new(sink_handle.mixer());
-    player.set_volume(DEFAULT_VOLUME);
+    // 音量以共享状态为唯一来源，这里不再自带一份拷贝
+    player.set_volume(state.lock().unwrap().volume);
 
     loop {
         // 1. 非阻塞处理控制命令
@@ -121,6 +122,13 @@ pub fn audio_thread(
 
             Ok(Command::SetMode(mode)) => {
                 state.lock().unwrap().play_mode = mode;
+            }
+
+            Ok(Command::SetVolume(volume)) => {
+                // 越界值不直达混音器：模型说多少就是多少
+                let volume = volume.clamp(0.0, 1.0);
+                player.set_volume(volume);
+                state.lock().unwrap().volume = volume;
             }
 
             Ok(Command::Stop) => {

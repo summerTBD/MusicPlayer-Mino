@@ -7,7 +7,6 @@
 //! - [`App::view`]：只加锁读状态并交给 [`crate::ui::render`]，本身不改任何东西。
 
 use std::io;
-use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -16,7 +15,7 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
 use crate::audio::audio_thread;
-use crate::config::{MUSIC_DIRECTORY, UI_REFRESH_MS};
+use crate::config::{Config, UI_REFRESH_MS, VOLUME_STEP};
 use crate::music::collect_music_files;
 use crate::state::{Command, PlayerState};
 use crate::ui;
@@ -34,6 +33,10 @@ pub enum Message {
     TogglePause,
     /// 切换播放模式
     CycleMode,
+    /// 调大音量
+    VolumeUp,
+    /// 调小音量
+    VolumeDown,
     /// 数字键：追加到输入缓冲
     Input(char),
     /// 退格：删除输入缓冲最后一个字符
@@ -59,6 +62,9 @@ impl Message {
             KeyCode::Char('p' | 'P') => Some(Self::Prev),
             KeyCode::Char(' ') => Some(Self::TogglePause),
             KeyCode::Char('m' | 'M') => Some(Self::CycleMode),
+            // `=` / `_` 是同一个物理键不加 Shift 的写法，顺手一起收
+            KeyCode::Char('+' | '=') => Some(Self::VolumeUp),
+            KeyCode::Char('-' | '_') => Some(Self::VolumeDown),
             KeyCode::Char(c) if c.is_ascii_digit() => Some(Self::Input(c)),
             KeyCode::Enter => Some(Self::SubmitInput),
             KeyCode::Backspace => Some(Self::Backspace),
@@ -73,6 +79,8 @@ impl Message {
 
 /// 应用主体：持有状态与通信通道，驱动「事件 → 消息 → 更新 → 渲染」循环
 pub struct App {
+    /// 运行期配置（音乐目录、初始音量、配置来源）
+    config: Config,
     /// 与音频线程共享的播放器状态
     state: Arc<Mutex<PlayerState>>,
     /// 主线程 → 音频线程的命令通道
@@ -84,15 +92,16 @@ pub struct App {
 }
 
 impl App {
-    /// 扫描音乐目录、建立共享状态并启动音频后台线程
+    /// 读取配置、扫描音乐目录、建立共享状态并启动音频后台线程
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let music_dir = Path::new(MUSIC_DIRECTORY);
+        let config = Config::load();
+        let music_dir = &config.music_directory;
         let playlist = collect_music_files(music_dir)?;
         if playlist.is_empty() {
             return Err(format!("目录 {} 中未找到支持的音频文件", music_dir.display()).into());
         }
 
-        let state = Arc::new(Mutex::new(PlayerState::new(playlist)));
+        let state = Arc::new(Mutex::new(PlayerState::new(playlist, config.volume)));
         let (tx, rx) = mpsc::channel();
 
         // 音频线程：clone 一份发送端用于自动切歌
@@ -105,6 +114,7 @@ impl App {
         });
 
         Ok(Self {
+            config,
             state,
             tx,
             view: ui::ViewState::new(),
@@ -167,6 +177,8 @@ impl App {
                 let new_mode = self.state.lock().unwrap().play_mode.cycle();
                 let _ = self.tx.send(Command::SetMode(new_mode));
             }
+            Message::VolumeUp => self.adjust_volume(VOLUME_STEP),
+            Message::VolumeDown => self.adjust_volume(-VOLUME_STEP),
             Message::Input(c) => {
                 self.view.input_error = None; // 重新输入即消掉上一次的报错
                 self.view.input.push(c);
@@ -222,6 +234,12 @@ impl App {
         let _ = self.tx.send(Command::Play(index));
     }
 
+    /// 调整音量：先乐观改模型（连续快按不会丢步），再把结果发给音频线程
+    fn adjust_volume(&mut self, delta: f32) {
+        let volume = self.state.lock().unwrap().adjust_volume(delta);
+        let _ = self.tx.send(Command::SetVolume(volume));
+    }
+
     /// 移动列表光标（j/k）
     ///
     /// 光标是**选择**，窗口是**视野**：这里只动光标，「让光标可见」的活儿
@@ -257,6 +275,6 @@ impl App {
     /// 模型只读；`view` 可变，但渲染只会夹紧视图自己的窗口边界。
     fn view(&mut self, frame: &mut Frame) {
         let state = self.state.lock().unwrap();
-        ui::render(frame, &state, &mut self.view);
+        ui::render(frame, &state, &self.config, &mut self.view);
     }
 }

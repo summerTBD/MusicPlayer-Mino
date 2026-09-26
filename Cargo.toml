@@ -9,3 +9,5 @@ rodio = "0.22.2"
 # 终端 UI 控制（清屏、光标、原始输入模式、事件轮询），0.29 为最新版
 crossterm = "0.29"
 ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.6"
