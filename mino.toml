@@ -5,7 +5,7 @@
 # 路径建议用单引号（TOML 字面量字符串），反斜杠就不用写成 \\ 了。
 
 # 音乐目录
-music_directory = 'E:\MyMusic'
+music_directory = 'E:\_music'
 
 # 启动时的初始音量，取值 0.0 ~ 1.0（运行中可随时按 + / - 调整）
 volume = 0.8

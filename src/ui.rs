@@ -67,7 +67,7 @@ pub fn render(frame: &mut Frame, state: &PlayerState, config: &Config, view: &mu
         Constraint::Length(title_height), // 标题（带边框）
         Constraint::Min(5),               // 播放列表：占满剩余空间
         Constraint::Length(6),            // 状态 + 进度条 + 输入（带边框，内部 4 行）
-        Constraint::Length(5),            // 快捷键（带边框，内部 3 行）
+        Constraint::Length(6),            // 快捷键（带边框，内部 4 行）
     ])
     .areas(frame.area());
 
@@ -231,7 +231,7 @@ fn render_status(frame: &mut Frame, state: &PlayerState, view: &ViewState, area:
         .gauge_style(Style::new().fg(Color::Green));
     frame.render_widget(gauge, gauge_area);
 
-    // 输入行：三态 —— 报错（红）/ 空（灰提示）/ 输入中（黄 + 光标块）
+    // 提示行：输入报错（红）/ 正在输入（黄）/ 设备告警（红）/ 空提示（灰）
     let input_line = if let Some(rejected) = &view.input_error {
         Line::styled(
             format!(
@@ -240,15 +240,21 @@ fn render_status(frame: &mut Frame, state: &PlayerState, view: &ViewState, area:
             ),
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
-    } else if view.input.is_empty() {
-        Line::styled(
-            "输入: 数字 + 回车 → 跳转歌曲",
-            Style::new().fg(Color::DarkGray),
-        )
-    } else {
+    } else if !view.input.is_empty() {
         Line::styled(
             format!("输入: {}▏", view.input),
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
+    } else if let Some(error) = &state.stream_error {
+        // 设备都没了就别再提示输入了：先把「按 r 能救回来」告诉用户
+        Line::styled(
+            format!("⚠ 音频设备已断开，按 r 重连（{error}）"),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Line::styled(
+            "输入: 数字 + 回车 → 跳转歌曲",
+            Style::new().fg(Color::DarkGray),
         )
     };
     frame.render_widget(Paragraph::new(input_line), input_area);
@@ -289,7 +295,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let help = Paragraph::new(vec![
         Line::from(" 数字+回车 → 播放指定歌曲 | n → 下一首 | p → 上一首"),
         Line::from(" j/k → 移动光标（回车播放） | ↑/↓ → 滚动窗口"),
-        Line::from(" 空格 → 暂停/继续 | m → 切换播放模式 | +/- → 音量 | q → 退出"),
+        Line::from(" 空格 → 暂停/继续 | m → 切换播放模式 | +/- → 音量"),
+        Line::from(" r → 耳机没声音时重连音频设备 | q → 退出"),
     ])
     .style(style)
     .block(bordered(" ⌨️ 快捷键 ", style));
@@ -311,7 +318,14 @@ mod tests {
 
     /// 把一帧画到内存缓冲里再抽成文本，不碰真实终端
     fn render_text(config: &Config, volume: f32) -> String {
-        let state = PlayerState::new(vec![PathBuf::from("a.mp3")], volume);
+        render_state_text(
+            config,
+            PlayerState::new(vec![PathBuf::from("a.mp3")], volume),
+        )
+    }
+
+    /// 同上，但用外部给定的状态（验证依赖模型字段的显示分支）
+    fn render_state_text(config: &Config, state: PlayerState) -> String {
         let mut view = ViewState::new();
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
@@ -341,6 +355,29 @@ mod tests {
         assert!(text.contains("音量:80%"), "界面没显示音量:\n{text}");
         assert!(text.contains("配置:"), "界面没显示配置来源:\n{text}");
         assert!(text.contains("+/-→音量"), "快捷键提示缺音量:\n{text}");
+    }
+
+    #[test]
+    fn shows_device_refresh_hotkey() {
+        let text = squeeze(&render_text(&Config::default(), 0.8));
+        assert!(
+            text.contains("r→耳机没声音时重连音频设备"),
+            "快捷键提示缺重连设备:\n{text}"
+        );
+    }
+
+    #[test]
+    fn shows_device_warning_instead_of_input_hint() {
+        let state = PlayerState {
+            stream_error: Some("设备已失效".to_string()),
+            ..PlayerState::new(vec![PathBuf::from("a.mp3")], 0.8)
+        };
+        let text = squeeze(&render_state_text(&Config::default(), state));
+        assert!(text.contains("按r重连"), "设备告警没显示:\n{text}");
+        assert!(
+            !text.contains("跳转歌曲"),
+            "有设备告警时不该再占着提示行讲输入:\n{text}"
+        );
     }
 
     #[test]

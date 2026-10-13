@@ -33,6 +33,8 @@ pub enum Message {
     TogglePause,
     /// 切换播放模式
     CycleMode,
+    /// 重连音频输出设备（耳机没声时手动救场）
+    RefreshAudio,
     /// 调大音量
     VolumeUp,
     /// 调小音量
@@ -62,6 +64,7 @@ impl Message {
             KeyCode::Char('p' | 'P') => Some(Self::Prev),
             KeyCode::Char(' ') => Some(Self::TogglePause),
             KeyCode::Char('m' | 'M') => Some(Self::CycleMode),
+            KeyCode::Char('r' | 'R') => Some(Self::RefreshAudio),
             // `=` / `_` 是同一个物理键不加 Shift 的写法，顺手一起收
             KeyCode::Char('+' | '=') => Some(Self::VolumeUp),
             KeyCode::Char('-' | '_') => Some(Self::VolumeDown),
@@ -176,6 +179,9 @@ impl App {
             Message::CycleMode => {
                 let new_mode = self.state.lock().unwrap().play_mode.cycle();
                 let _ = self.tx.send(Command::SetMode(new_mode));
+            }
+            Message::RefreshAudio => {
+                let _ = self.tx.send(Command::RefreshDevice);
             }
             Message::VolumeUp => self.adjust_volume(VOLUME_STEP),
             Message::VolumeDown => self.adjust_volume(-VOLUME_STEP),

@@ -48,6 +48,10 @@ pub enum Command {
     SetMode(PlayMode),
     /// 设置音量（0.0 ~ 1.0）
     SetVolume(f32),
+    /// 重新打开默认输出设备（耳机断电重连、切换输出后没声音时用）
+    RefreshDevice,
+    /// 音频流出错：由 cpal 的错误回调投递，不是主线程发的命令
+    StreamError(String),
     /// 停止播放
     Stop,
     /// 退出程序
@@ -65,6 +69,9 @@ pub struct PlayerState {
     pub play_mode: PlayMode,
     /// 当前音量（0.0 ~ 1.0）；主线程按键改，音频线程据此设置播放器
     pub volume: f32,
+    /// 最近一次音频流错误（如耳机断开导致端点消失）；`None` = 一切正常。
+    /// 界面据此提示用户按 `r` 重连
+    pub stream_error: Option<String>,
 }
 
 impl PlayerState {
@@ -78,6 +85,7 @@ impl PlayerState {
             is_paused: false,
             play_mode: PlayMode::Sequential,
             volume: volume.clamp(0.0, 1.0),
+            stream_error: None,
         }
     }
 

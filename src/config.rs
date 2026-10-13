@@ -39,7 +39,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            music_directory: PathBuf::from(r"E:\MyMusic"),
+            music_directory: PathBuf::from(r"E:\_music"),
             volume: 0.8,
             source: None,
             error: None,
